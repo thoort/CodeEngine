@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <title>Demo Hero</title>
+  <link rel="stylesheet" href="page.css">
+</head>
+
+<body>
+  <div class=container>
+    <div class="row">
+      <div class="column-100">
+        <h1 class="title">Demo Hero - Image Colorizer</h1>
+        <h2 class="subtitle">It might be nonsense - but it sure is fun.</h2>
+      </div>
+    </div>
+    <div class="row">
+      <div class="column-2">
+        <div class="body-1">Sample images</div>
+        <div class="samples">
+          <image class="pict" src="pictures/dog1.jpg" />
+          <image class="pict" src="pictures/dog2.jpg" />
+          <image class="pict" src="pictures/dog3.jpg" />
+          <image class="pict" src="pictures/dog4.jpg" />
+          <image class="pict" src="pictures/dog5.jpg" />
+          <image class="pict" src="pictures/dog6.jpg" />
+          <image class="pict" src="pictures/dog7.jpg" />
+          <image class="pict" src="pictures/dog8.jpg" />
+        </div>
+      </div>
+      <div class="column-4">
+        <div class="body-1">Drag a sample image into the preview</div>
+        <input data-file-input type="file" class="fileInput" accept="image/*" onchange="previewPicture(this.files[0])">
+        <image data-picture-preview class="picture-preview" />
+        <button data-upload type="button">
+          Upload an image file (PNG)
+        </button>
+      </div>
+      <div class="column-2">
+      </div>
+      <div class="column-8">
+        <button data-generate>Colorize</button>
+        <image data-thumbnail class="thumbnail" />
+        <div data-progress class="progress"></div>
+      </div>
+    </div>
+  </div>
+</body>
+<script src="page.js"></script>
+
+</html>
