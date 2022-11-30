@@ -5,34 +5,44 @@ const { readFileSync, writeFileSync } = require('fs');
 const { resolve: resolvePath } = require('path');
 const zlib = require('zlib');
 
-const crcForBuffer = crcForBufferFactory();
-
+const calculateCrcForBuffer = calculateCrcForBufferFactory();
 const basePath = __dirname; // serving files from here
+const pngPreambleBuf = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 function makeThumbnailProm(imgDataBuf) {
   return new Promise((resolve, reject) => {
-    let result;
+    // parse
+    let canvas;
     try {
-      result = parsePng(imgDataBuf);
+      canvas = pngToCanvas(imgDataBuf);
     } catch (err) {
       reject(err);
       return;
     }
-    resolve(result);
+    // modify
+    modifyCanvas(canvas);
+    // output
+    let pngBuf;
+    try {
+      pngBuf = canvasToPng(canvas);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    resolve(pngBuf);
   });
 }
 
-function parsePng(imgDataBuf) {
-  const preambleBuf = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+function pngToCanvas(pngDataBuf) {
+  // parse PNG format
   let ihdr;
   let compressedPixelData = Buffer.alloc(0);
-  let pixelData;
-  if (preambleBuf.compare(imgDataBuf, 0, preambleBuf.byteLength) !== 0) {
+  if (pngPreambleBuf.compare(pngDataBuf, 0, pngPreambleBuf.byteLength) !== 0) {
     throw new Error('no valid PNG preamble');
   }
-  let offset = preambleBuf.byteLength; // chunks start after the preamble
-  while (offset < imgDataBuf.byteLength) {
-    const { chLength, chType, chData } = readChunk(imgDataBuf, offset);
+  let offset = pngPreambleBuf.byteLength; // chunks start after the preamble
+  while (offset < pngDataBuf.byteLength) {
+    const { chLength, chType, chData } = readChunk(pngDataBuf, offset);
     offset += chLength + 12; // total chunk size is 4 (length) + 4 (type) + chLength + 4 (CRC)
     switch (chType) {
       case 'IHDR': {
@@ -45,12 +55,14 @@ function parsePng(imgDataBuf) {
       }
     }
   }
-  if (offset !== imgDataBuf.byteLength) {
-    throw new Error(`parsed length (${offset}) does not match buffer length (${imgDataBuf.byteLength})`);
+  if (offset !== pngDataBuf.byteLength) {
+    throw new Error(`parsed length (${offset}) does not match buffer length (${pngDataBuf.byteLength})`);
   }
-  pixelData = zlib.inflateSync(compressedPixelData);
+  const pixelData = zlib.inflateSync(compressedPixelData);
   const { width, height, colorType } = ihdr;
   const bytesPerPixel = (colorType & 4) ? 4 : 3;
+  // undo scanline pixel filters and collect canvas data
+  const canvasData = [];
   const scanlinePixelBytes = width * bytesPerPixel;
   const scanlineTotalBytes = scanlinePixelBytes + 1; // plus filter type byte at the beginning of each line
   for (let scanlineIdx = 0; scanlineIdx < height; scanlineIdx += 1) {
@@ -76,30 +88,16 @@ function parsePng(imgDataBuf) {
     } else {
       throw new Error(`unsupported filter type ${filterType}`);
     }
+    canvasData.push(pixelData.slice(pixelStart, pixelStart + scanlinePixelBytes));
   }
-
-  // modify
-  for (let scanlineIdx = 0; scanlineIdx < height; scanlineIdx += 1) {
-    const scanlineStart = scanlineIdx * scanlineTotalBytes;
-    const pixelStart = scanlineStart + 1;
-    for (let i = 0; i < scanlinePixelBytes; i += bytesPerPixel) {
-      pixelData[pixelStart + i + 0] = 0.1 * pixelData[pixelStart + i + 0]; // red
-      pixelData[pixelStart + i + 1] = 2 * pixelData[pixelStart + i + 1]; // green
-      pixelData[pixelStart + i + 2] = 3 * pixelData[pixelStart + i + 2]; // blue
-      if (bytesPerPixel === 4) {
-        pixelData[pixelStart + i + 3] = pixelData[pixelStart + i + 3]; // alpha
-      }
-    }
-  }
-
-  // construct
-  const outBuf = Buffer.alloc(2 * imgDataBuf.byteLength); // same size so far
-  offset = writePreambleToBuffer(outBuf);
-  offset = writeIhdrChunkToBuffer(ihdr, outBuf, offset);
-  const newCompressedPixelData = zlib.deflateSync(pixelData);
-  offset = writeIdatChunkToBuffer(newCompressedPixelData, outBuf, offset);
-  offset = writeIendChunkToBuffer(outBuf, offset);
-  return outBuf.slice(0, offset);
+  const canvas = {
+    type: 'rgbcanvas',
+    width,
+    height,
+    bytesPerPixel,
+    data: canvasData
+  };
+  return canvas;
 
   function readIhdrFromChunkData(chunkData) {
     let offset = 0;
@@ -131,8 +129,96 @@ function parsePng(imgDataBuf) {
     };
   }
 
+  function readChunk(buf, offsetArg) {
+    let offset = offsetArg;
+    // chunk length
+    const chLength = buf.readUint32BE(offset);
+    if (buf.byteLength < offset + chLength + 12) {
+      throw new Error(`invalid chunk length (${chLength}) at byte ${offset}`);
+    }
+    offset += 4; // uint32
+    const crcCalculationStart = offset;
+    // chunk type
+    const chType = buf.toString('utf8', offset, offset + 4);
+    offset += 4;
+    // chunk data
+    const chData = buf.slice(offset, offset + chLength);
+    offset += chLength;
+    const crcCalculationEnd = offset;
+    // chunk CRC
+    const chCrc = buf.readUint32BE(offset);
+    const calculatedCrc = new Uint32Array(1);
+    calculatedCrc[0] = calculateCrcForBuffer(buf.slice(crcCalculationStart, crcCalculationEnd));
+    if (chCrc !== calculatedCrc[0]) {
+      throw new Error(`CRC mismatch in chunk of type ${chType}`);
+    }
+    return {
+      chLength,
+      chType,
+      chData
+    };
+  }
+}
+
+function modifyCanvas(canvas) {
+  const { type, width, height, bytesPerPixel, data } = canvas;
+  if (type !== 'rgbcanvas') {
+    return;
+  }
+  const rMod = Math.random() * 2;
+  const gMod = Math.random() * 2;
+  const bMod = Math.random() * 2;
+  // color modification
+  for (let scanlineIdx = 0; scanlineIdx < height; scanlineIdx += 1) {
+    const scanline = data[scanlineIdx]; // buffer
+    for (let i = 0; i + bytesPerPixel <= scanline.byteLength; i += bytesPerPixel) {
+      scanline[i] = rMod * scanline[i]; // red
+      scanline[i + 1] = gMod * scanline[i + 1]; // green
+      scanline[i + 2] = bMod * scanline[i + 2]; // blue
+      if (bytesPerPixel === 4) {
+        // scanline[i + 2] = scanline[i + 2]; // alpha
+      }
+    }
+  }
+}
+
+function canvasDataToImgDataBuf(canvasData) {
+  let imgDataBuf = Buffer.alloc(0);
+  canvasData.forEach(line => {
+    imgDataBuf = Buffer.concat([imgDataBuf, Buffer.from([0]), line]); // prepending filter byte
+  });
+  return imgDataBuf;
+}
+
+function canvasToPng(canvas) {
+  const { type, width, height, bytesPerPixel, data } = canvas;
+  if (type !== 'rgbcanvas') {
+    return;
+  }
+  const sizeEstimate = width * height * bytesPerPixel + 1000; // at least preamble, IHDR, IDAT overhead, IEND
+  const pngDataBuf = Buffer.alloc(sizeEstimate);
+  let offset = writePreambleToBuffer(pngDataBuf);
+  offset = writeIhdrChunkToBuffer(ihdrForRgbCanvas(canvas), pngDataBuf, offset);
+  const compressedDataBuf = zlib.deflateSync(canvasDataToImgDataBuf(data));
+  offset = writeIdatChunkToBuffer(compressedDataBuf, pngDataBuf, offset); // TODO: split in chunks of max 2^31 bytes
+  offset = writeIendChunkToBuffer(pngDataBuf, offset);
+  return pngDataBuf.slice(0, offset);
+
+  function ihdrForRgbCanvas(canvas) {
+    const { width, height, bytesPerPixel } = canvas;
+    return {
+      width,
+      height,
+      bitDepth: 8,
+      colorType: (bytesPerPixel === 3) ? 2 : 6, //  1 (palette used), 2 (color used), and 4 (alpha channel used). Valid values are 0, 2, 3, 4, and 6.
+      compressionMethod: 0, // deflate-inflate
+      filterMethod: 0, // adaptive filtering
+      interlaceMethod: 0 // no interlace
+    };
+  }
+
   function writePreambleToBuffer(buf) { // start offset is 0
-    return preambleBuf.copy(buf);
+    return pngPreambleBuf.copy(buf);
   }
 
   function writeIhdrChunkToBuffer(ihdr, buf, offsetArg) {
@@ -150,7 +236,7 @@ function parsePng(imgDataBuf) {
     offset = buf.writeUInt8(filterMethod, offset);
     offset = buf.writeUInt8(interlaceMethod, offset);
     const crcCalculationEnd = offset;
-    offset = buf.writeUInt32BE(crcForBuffer(buf.slice(crcCalculationStart, crcCalculationEnd)), offset);
+    offset = buf.writeUInt32BE(calculateCrcForBuffer(buf.slice(crcCalculationStart, crcCalculationEnd)), offset);
     return offset;
   }
 
@@ -162,7 +248,7 @@ function parsePng(imgDataBuf) {
     offset += buf.write('IDAT', offset);
     offset += imgData.copy(buf, offset);
     const crcCalculationEnd = offset;
-    offset = buf.writeUInt32BE(crcForBuffer(buf.slice(crcCalculationStart, crcCalculationEnd)), offset);
+    offset = buf.writeUInt32BE(calculateCrcForBuffer(buf.slice(crcCalculationStart, crcCalculationEnd)), offset);
     return offset;
   }
 
@@ -173,57 +259,14 @@ function parsePng(imgDataBuf) {
     const crcCalculationStart = offset;
     offset += buf.write('IEND', offset);
     const crcCalculationEnd = offset;
-    offset = buf.writeUInt32BE(crcForBuffer(buf.slice(crcCalculationStart, crcCalculationEnd)), offset);
+    offset = buf.writeUInt32BE(calculateCrcForBuffer(buf.slice(crcCalculationStart, crcCalculationEnd)), offset);
     return offset;
-  }
-
-  function readChunk(buf, offsetArg) {
-    let offset = offsetArg;
-    // chunk length
-    const chLength = buf.readUint32BE(offset);
-    if (buf.byteLength < offset + chLength + 12) {
-      throw new Error(`invalid chunk length (${chLength}) at byte ${offset}`);
-    }
-    offset += 4; // uint32
-    const crcCalculationStart = offset;
-    // chunk type
-    const chType = imgDataBuf.toString('utf8', offset, offset + 4);
-    offset += 4;
-    // chunk data
-    const chData = imgDataBuf.slice(offset, offset + chLength);
-    offset += chLength;
-    const crcCalculationEnd = offset;
-    // chunk CRC
-    const chCrc = imgDataBuf.readUint32BE(offset);
-    const calculatedCrc = new Uint32Array(1);
-    calculatedCrc[0] = crcForBuffer(buf.slice(crcCalculationStart, crcCalculationEnd));
-    if (chCrc !== calculatedCrc[0]) {
-      throw new Error(`CRC mismatch in chunk of type ${chType}`);
-    }
-    return {
-      chLength,
-      chType,
-      chData
-    };
-  }
-
-  function formatImageData() {
-    const rowLen = width * bytesPerPixel + 1;
-    let output = '';
-    for (let i = 0; i < pixelData.byteLength; i += rowLen) {
-      for (let j = 0; j < rowLen && i + j < pixelData.byteLength; j += 1) {
-        if (0 === (j - 1) % bytesPerPixel) {
-          output += ' ';
-        }
-        output += `${('0' + pixelData[i + j].toString(16)).slice(-2)} `;
-      }
-      output += '\n';
-    }
-    return output;
   }
 }
 
-function crcForBufferFactory() {
+function calculateCrcForBufferFactory() {
+  // http://www.libpng.org/pub/png/spec/1.2/PNG-CRCAppendix.html
+  // https://en.wikipedia.org/wiki/Cyclic_redundancy_check
   const crcTable = (function initTable() {
     const tableSize = 256;
     const result = new Uint32Array(tableSize);
@@ -242,7 +285,7 @@ function crcForBufferFactory() {
     return result;
   }());
 
-  return function crcForBuffer(buffer) {
+  return function calculateCrcForBuffer(buffer) {
     const buf = Uint8Array.from(buffer);
     const result = new Uint32Array(1);
     result[0] = calculateCrc(0xffffffff, buf, buf.byteLength) ^ 0xffffffff; // 1's complement
@@ -259,6 +302,14 @@ function crcForBufferFactory() {
     return c[0];
   }
 }
+
+const mimetypeByExtension = Object.assign(Object.create(null), {
+  'css': 'text/css',
+  'html': 'text/html',
+  'jpg': 'image/jpeg',
+  'js': 'text/javascript',
+  'png': 'image/png'
+});
 
 function handleHttpReq(req, res) {
   let reqPath = req.url;
@@ -317,9 +368,8 @@ function handleHttpReq(req, res) {
     res.end('Bad path');
     return;
   }
-
+  // serve file at basePath/reqPath
   let pageContent;
-
   try {
     pageContent = readFileSync(`${basePath}/${reqPath}`);
   } catch (err) {
@@ -328,6 +378,7 @@ function handleHttpReq(req, res) {
     res.end(`Error reading file: ${err.message}`);
     return;
   }
+  res.setHeader('Content-Type', mimetypeByExtension[(reqPath.match(/\.([^.]+)$/) || [])[1]] || 'text/plain');
   res.statusCode = 200;
   res.end(pageContent);
 }
